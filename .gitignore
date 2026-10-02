@@ -50,3 +50,5 @@ stage_1_test_images/
 stage_2_test_images/
 train_png/
 test_png/
+
+outputs/

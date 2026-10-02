@@ -31,33 +31,108 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
-# Add 2DNet/src to sys.path so we can import from net.models
+# Add 2DNet/src to sys.path so we can import from net.models if present
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(CURRENT_DIR, "2DNet", "src")
-if SRC_DIR not in sys.path:
+if os.path.isdir(SRC_DIR) and SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-# Import model architectures from 2DNet/src/net/models.py
 try:
-    from net.models import (
-        se_resnext101_32x4d,
-        se_resnext50_32x4d,
-        DenseNet169_change_avg,
-        DenseNet121_change_avg,
-    )
+    import torchvision
 except ImportError:
-    import importlib.util
-    models_path = os.path.join(SRC_DIR, "net", "models.py")
-    spec = importlib.util.spec_from_file_location("net.models", models_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load models from {models_path}")
-    models_mod = importlib.util.module_from_spec(spec)
-    sys.modules["net.models"] = models_mod
-    spec.loader.exec_module(models_mod)
-    se_resnext101_32x4d = models_mod.se_resnext101_32x4d
-    se_resnext50_32x4d = models_mod.se_resnext50_32x4d
-    DenseNet169_change_avg = models_mod.DenseNet169_change_avg
-    DenseNet121_change_avg = models_mod.DenseNet121_change_avg
+    torchvision = None
+
+try:
+    import pretrainedmodels
+except ImportError:
+    pretrainedmodels = None
+
+
+def _get_densenet_features(arch_name, pretrained=False):
+    """Safely obtain DenseNet feature extractor compatible across torchvision versions."""
+    fn = getattr(torchvision.models, arch_name)
+    try:
+        if arch_name == 'densenet121':
+            from torchvision.models import DenseNet121_Weights
+            weights = DenseNet121_Weights.DEFAULT if pretrained else None
+        elif arch_name == 'densenet169':
+            from torchvision.models import DenseNet169_Weights
+            weights = DenseNet169_Weights.DEFAULT if pretrained else None
+        else:
+            weights = None
+        return fn(weights=weights).features
+    except (ImportError, AttributeError):
+        return fn(pretrained=pretrained).features
+
+
+class se_resnext50_32x4d(nn.Module):
+    def __init__(self, pretrained=False):
+        super(se_resnext50_32x4d, self).__init__()
+        if pretrainedmodels is None:
+            raise RuntimeError("pretrainedmodels is required. Install: pip install pretrainedmodels==0.7.4")
+        self.model_ft = pretrainedmodels.__dict__['se_resnext50_32x4d'](
+            num_classes=1000,
+            pretrained='imagenet' if pretrained else None
+        )
+        num_ftrs = self.model_ft.last_linear.in_features
+        self.model_ft.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.model_ft.last_linear = nn.Sequential(nn.Linear(num_ftrs, 6, bias=True))
+
+    def forward(self, x):
+        return self.model_ft(x)
+
+
+class se_resnext101_32x4d(nn.Module):
+    def __init__(self, pretrained=False):
+        super(se_resnext101_32x4d, self).__init__()
+        if pretrainedmodels is None:
+            raise RuntimeError("pretrainedmodels is required. Install: pip install pretrainedmodels==0.7.4")
+        self.model_ft = pretrainedmodels.__dict__['se_resnext101_32x4d'](
+            num_classes=1000,
+            pretrained='imagenet' if pretrained else None
+        )
+        num_ftrs = self.model_ft.last_linear.in_features
+        self.model_ft.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.model_ft.last_linear = nn.Sequential(nn.Linear(num_ftrs, 6, bias=True))
+
+    def forward(self, x):
+        return self.model_ft(x)
+
+
+class DenseNet169_change_avg(nn.Module):
+    def __init__(self, pretrained=False):
+        super(DenseNet169_change_avg, self).__init__()
+        self.densenet169 = _get_densenet_features('densenet169', pretrained=pretrained)
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.relu = nn.ReLU()
+        self.mlp = nn.Linear(1664, 6)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.densenet169(x)
+        x = self.relu(x)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.mlp(x)
+        return x
+
+
+class DenseNet121_change_avg(nn.Module):
+    def __init__(self, pretrained=False):
+        super(DenseNet121_change_avg, self).__init__()
+        self.densenet121 = _get_densenet_features('densenet121', pretrained=pretrained)
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.relu = nn.ReLU()
+        self.mlp = nn.Linear(1024, 6)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.densenet121(x)
+        x = self.relu(x)
+        x = self.avgpool(x)
+        x = x.view(-1, 1024)
+        x = self.mlp(x)
+        return x
 
 # The 6 intracranial hemorrhage labels predicted by all models
 LABELS = ["any", "epidural", "intraparenchymal", "intraventricular", "subarachnoid", "subdural"]
@@ -73,6 +148,7 @@ MODEL_REGISTRY = {
         "default_image_size": 256,
         "aliases": ["se_resnext101", "resnext101"],
         "get_layers": lambda m: [
+            ("layer1", m.model_ft.layer1),
             ("layer2", m.model_ft.layer2),
             ("layer3", m.model_ft.layer3),
             ("layer4", m.model_ft.layer4),
@@ -83,6 +159,7 @@ MODEL_REGISTRY = {
         "default_image_size": 256,
         "aliases": ["se_resnext50", "resnext50"],
         "get_layers": lambda m: [
+            ("layer1", m.model_ft.layer1),
             ("layer2", m.model_ft.layer2),
             ("layer3", m.model_ft.layer3),
             ("layer4", m.model_ft.layer4),
@@ -93,6 +170,7 @@ MODEL_REGISTRY = {
         "default_image_size": 256,
         "aliases": ["densenet169", "dense169", "densenet169_change_avg"],
         "get_layers": lambda m: [
+            ("denseblock1", m.densenet169.denseblock1),
             ("denseblock2", m.densenet169.denseblock2),
             ("denseblock3", m.densenet169.denseblock3),
             ("denseblock4", m.densenet169.denseblock4),
@@ -103,6 +181,7 @@ MODEL_REGISTRY = {
         "default_image_size": 512,
         "aliases": ["densenet121", "dense121", "densenet121_change_avg"],
         "get_layers": lambda m: [
+            ("denseblock1", m.densenet121.denseblock1),
             ("denseblock2", m.densenet121.denseblock2),
             ("denseblock3", m.densenet121.denseblock3),
             ("denseblock4", m.densenet121.denseblock4),
@@ -147,23 +226,63 @@ DEFAULT_CHECKPOINTS = [
     "model_epoch_best_2.pth",
     "model_epoch_best_3.pth",
     "seresnext101.pth",
+    "resnext101_32x8d_wsl_checkpoint.pth",
 ]
 
 
 def resolve_path(path: str) -> str:
-    """Resolve file path, checking current directory, script directory, parent directory, and Downloads."""
-    if not path or os.path.exists(path):
+    """Resolve file, checkpoint, or image path across current directory, script directory, checkpoints directories, parent directories, and user's Downloads folder."""
+    if not path:
         return path
+    clean = path.strip().strip("\"'").strip()
+    if not clean:
+        return clean
+
+    # If directly exists as absolute or relative path
+    if os.path.exists(clean):
+        return os.path.abspath(clean)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cwd = os.getcwd()
+    downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+    base_name = os.path.basename(clean)
+
     candidates = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), path),
-        os.path.join("..", path),
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), path),
-        os.path.join(os.path.expanduser("~"), "Downloads", path),
+        os.path.join(cwd, clean),
+        os.path.join(script_dir, clean),
+        os.path.join(cwd, base_name),
+        os.path.join(script_dir, base_name),
+        os.path.join(cwd, "checkpoints", base_name),
+        os.path.join(script_dir, "checkpoints", base_name),
+        os.path.join(cwd, "..", clean),
+        os.path.join(script_dir, "..", clean),
+        os.path.join(script_dir, "..", "checkpoints", base_name),
+        os.path.join(script_dir, "..", "..", clean),
+        os.path.join(downloads, clean),
+        os.path.join(downloads, base_name),
+        os.path.join(downloads, "RSNA2019_Intracranial-Hemorrhage-Detection-master", base_name),
+        os.path.join(downloads, "RSNA2019_Intracranial-Hemorrhage-Detection-master", "checkpoints", base_name),
+        os.path.join(downloads, "rsna-master", base_name),
+        os.path.join(downloads, "rsna-master", "rsna-master", base_name),
+        os.path.join(downloads, "rsna-master", "rsna-master", "checkpoints", base_name),
+        os.path.join(downloads, "rsna-master", "checkpoints", base_name),
     ]
+
     for c in candidates:
         if os.path.exists(c):
-            return c
-    return path
+            return os.path.abspath(c)
+
+    # Case-insensitive match in key folders
+    for folder in [cwd, script_dir, os.path.join(cwd, "checkpoints"), os.path.join(script_dir, "checkpoints"), downloads]:
+        if os.path.isdir(folder):
+            try:
+                for entry in os.listdir(folder):
+                    if entry.lower() == base_name.lower():
+                        return os.path.abspath(os.path.join(folder, entry))
+            except Exception:
+                pass
+
+    return clean
 
 
 def find_default_checkpoint() -> Optional[str]:
@@ -172,6 +291,36 @@ def find_default_checkpoint() -> Optional[str]:
         resolved = resolve_path(name)
         if os.path.exists(resolved):
             return resolved
+
+    # Search in common directories for any .pth file matching model_epoch_best or seresnext
+    downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cwd = os.getcwd()
+    search_dirs = [
+        cwd,
+        os.path.join(cwd, "checkpoints"),
+        script_dir,
+        os.path.join(script_dir, "checkpoints"),
+        os.path.join(script_dir, ".."),
+        os.path.join(script_dir, "..", "checkpoints"),
+        os.path.join(downloads, "RSNA2019_Intracranial-Hemorrhage-Detection-master"),
+        os.path.join(downloads, "rsna-master", "rsna-master", "checkpoints"),
+        os.path.join(downloads, "rsna-master", "rsna-master"),
+        os.path.join(downloads, "rsna-master", "checkpoints"),
+        os.path.join(downloads, "rsna-master"),
+        downloads,
+    ]
+
+    for d in search_dirs:
+        if os.path.isdir(d):
+            try:
+                for f in os.listdir(d):
+                    if f.endswith(".pth") and ("model_epoch_best" in f or "resnext" in f.lower() or "ich" in f.lower()):
+                        candidate = os.path.join(d, f)
+                        if os.path.isfile(candidate):
+                            return os.path.abspath(candidate)
+            except Exception:
+                pass
     return None
 
 
@@ -196,7 +345,7 @@ def load_model(
         auto_ckpt = find_default_checkpoint()
         if auto_ckpt:
             checkpoint = auto_ckpt
-            print(f"[Auto-Checkpoint] Loaded trained weights: {os.path.basename(checkpoint)}")
+            print(f"[Auto-Checkpoint] Found trained weights: {checkpoint}")
         else:
             checkpoint = None
     elif isinstance(checkpoint, str) and checkpoint.lower() in ["none", "untrained"]:
@@ -215,7 +364,7 @@ def load_model(
             print(f"  [Notice] Missing keys ({len(missing)}): {missing[:6]}")
         if unexpected:
             print(f"  [Notice] Unexpected keys ({len(unexpected)}): {unexpected[:6]}")
-        print("Checkpoint loaded successfully.")
+        print(f"[Model] Trained weights successfully loaded from '{os.path.basename(checkpoint)}'")
         has_checkpoint = True
     elif checkpoint:
         print(f"[Warning] Checkpoint '{checkpoint}' not found! Running with initialized weights.")
@@ -829,16 +978,11 @@ def show_popup_window(
             # Amber neutral tone for demo mode
             bar_colors.append("#ffb703" if s == max(scores_rev) else "#e0a000")
         elif is_safe:
-            # All green / calming tones when safe
-            bar_colors.append("#00e676" if s == max(scores_rev) else "#2ec4b6")
+            # All vibrant green when safe
+            bar_colors.append("#00e676" if s == max(scores_rev) else "#00c853")
         else:
-            # Highlight dangerous classes in bold red, others orange/blue
-            if s >= 50:
-                bar_colors.append("#ff1744")  # Alert red
-            elif s >= 25:
-                bar_colors.append("#ff9100")  # Orange warning
-            else:
-                bar_colors.append("#457b9d")  # Low / baseline
+            # All red when hemorrhage is detected
+            bar_colors.append("#ff1744" if s >= 50 else ("#ff5252" if s >= 20 else "#c62828"))
 
     bars = ax_pred.barh(classes_rev, scores_rev, color=bar_colors, height=0.62, edgecolor="#ffffff", linewidth=0.6)
     ax_pred.set_xlim(0, 108)
@@ -900,17 +1044,35 @@ def show_popup_window(
     plt.show()
 
 
+def format_ascii_bar(pct: float, width: int = 20) -> str:
+    """Generate a clean visual ASCII bar for probability percentage compatible with all Windows consoles."""
+    filled = int(round((pct / 100.0) * width))
+    filled = max(0, min(width, filled))
+    return "#" * filled + "-" * (width - filled)
+
+
+def clean_user_input_path(raw: str) -> str:
+    """Clean path string from terminal input, stripping quotes, powershell '&' prefix, and extra spaces."""
+    s = raw.strip()
+    if s.startswith("&"):
+        s = s[1:].strip()
+    return s.strip("\"'").strip()
+
+
 def _execute_and_display(
     predictor: ICHPredictor,
     input_data: Any,
     image_label: str,
     args: Any,
 ) -> None:
-    """Run prediction, print clinical diagnosis in terminal, and display popup window."""
-    output_prefix = None
-    if args.save or args.output is not None:
-        out_path = args.output if args.output else "ich_gradcam"
-        output_prefix = os.path.splitext(out_path)[0]
+    """Run prediction, print formatted clinical diagnosis in terminal with colors, and display popup window."""
+    output_dir = "outputs"
+    os.makedirs(output_dir, exist_ok=True)
+    import re
+    base_clean = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', os.path.splitext(image_label)[0])
+    default_output_prefix = os.path.join(output_dir, f"{base_clean}_gradcam")
+
+    output_prefix = os.path.splitext(args.output)[0] if args.output else default_output_prefix
 
     result = predictor.predict(
         inputs=input_data,
@@ -929,30 +1091,64 @@ def _execute_and_display(
     overall_p = max(any_p, max_subtype_p)
     is_safe = overall_p < args.safe_threshold
 
-    print("\n" + "=" * 55)
-    print(f"Scan: {image_label}")
-    print(f"Model: {result['model']}")
+    # ANSI Colors for terminal
+    COLOR_RESET = "\033[0m"
+    COLOR_GREEN = "\033[92m"
+    COLOR_RED = "\033[91m"
+    COLOR_YELLOW = "\033[93m"
+    COLOR_BOLD = "\033[1m"
+
     if not has_checkpoint:
-        print("[WARNING] Running without a trained checkpoint! Model weights are UNTRAINED.")
-        print("          Predictions hover around 50% randomly. Load a .pth file for real diagnosis.")
+        term_color = COLOR_YELLOW
+        diag_title = "[ DEMO / UNTRAINED ] (Random baseline ~50% - load a .pth file)"
     elif is_safe:
-        print("DIAGNOSIS: [ SAFE ] - Brain is Safe / No Hemorrhage Detected (Green)")
-        print(f"Confidence: {(1.0 - overall_p) * 100:.2f}% Normal")
+        term_color = COLOR_GREEN
+        diag_title = f"[ SAFE ] - Brain is Safe / No Hemorrhage Detected  |  Normal Confidence: {(1.0 - overall_p) * 100:.2f}%"
     else:
-        print(f"DIAGNOSIS: [ ALERT ] - Hemorrhage Detected: {result['target_class'].upper()} (Red)")
-        print(f"Risk Level: {overall_p * 100:.2f}%")
+        term_color = COLOR_RED
+        diag_title = f"[ ALERT ] - Hemorrhage Detected: {result['target_class'].upper()}  |  Risk Level: {overall_p * 100:.2f}%"
 
-    print("\nProbabilities:")
+    print("\n" + term_color + "=" * 68)
+    print(f"  SCAN: {image_label}")
+    print(f"  MODEL ARCHITECTURE: {result['model']}")
+    print(f"  DIAGNOSIS: {diag_title}")
+    print("=" * 68 + COLOR_RESET)
+
+    print(f"  {'CLASS':<20s} {'PROBABILITY':<12s} {'VISUAL BAR (0-100%)':<24s}")
+    print("-" * 68)
+
     for lab, p in result["probabilities"].items():
-        print(f"  {lab:18s}: {p * 100:.2f}%")
-    print("=" * 55)
+        pct = p * 100.0
+        bar = format_ascii_bar(pct, width=20)
+        if not has_checkpoint:
+            status_txt = "Demo"
+            c_tag = COLOR_YELLOW
+        elif is_safe:
+            status_txt = "Safe / Normal"
+            c_tag = COLOR_GREEN
+        else:
+            if pct >= 50:
+                status_txt = "HIGH RISK ALERT"
+                c_tag = COLOR_RED
+            elif pct >= 25:
+                status_txt = "Warning"
+                c_tag = COLOR_YELLOW
+            else:
+                status_txt = "Normal"
+                c_tag = COLOR_GREEN
 
+        print(f"  {c_tag}{lab:<20s} : {pct:6.2f}%   [{bar}] {status_txt}{COLOR_RESET}")
+
+    print("-" * 68)
+    print("  [Grad-CAM] Extracted gradients across layers (layer1, layer2, layer3, layer4) & projected onto head CT")
     if result.get("outputs"):
-        print("\nSaved Artifacts:")
         for k, v in result["outputs"].items():
-            print(f"  {k:12s}: {v}")
+            print(f"  Saved {k.capitalize()}: {v}")
+    print("=" * 68)
 
-    if not args.no_popup:
+    # Show popup window by default unless user passed --no-popup
+    if not getattr(args, "no_popup", False):
+        print(f"\n[Display] Opening interactive diagnostic popup window ({'SAFE: Green' if is_safe else 'ALERT: Red'})...")
         show_popup_window(
             original_img=result["central_slice"],
             overlay_bgr=result["overlay_bgr"],
@@ -968,7 +1164,7 @@ def _execute_and_display(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="RSNA 2019 Intracranial Hemorrhage Detection - Unified Model Inference & Grad-CAM Viewer."
+        description="RSNA 2019 Intracranial Hemorrhage Detection - Terminal Prediction & Grad-CAM Pipeline."
     )
     ap.add_argument(
         "--model",
@@ -999,14 +1195,14 @@ def main():
         help="Probability threshold below which the brain is considered safe/normal (default: 0.50).",
     )
     ap.add_argument(
-        "--save",
+        "--no-popup",
         action="store_true",
-        help="Save output artifacts to disk (by default, results are only shown in popup window).",
+        help="Disable GUI popup window (by default, popup window opens automatically).",
     )
     ap.add_argument(
         "--output",
         default=None,
-        help="Custom output path prefix if saving to disk (implies --save).",
+        help="Custom output path prefix if saving to disk.",
     )
     ap.add_argument("--mode", choices=["gradcam", "layercam"], default="gradcam")
     ap.add_argument(
@@ -1019,11 +1215,6 @@ def main():
     ap.add_argument("--target", default="auto", choices=["auto"] + LABELS, help="Target class for Grad-CAM.")
     ap.add_argument("--threshold", type=float, default=0.25, help="Heatmap suppression threshold.")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
-    ap.add_argument(
-        "--no-popup",
-        action="store_true",
-        help="Disable interactive popup window (e.g. for batch processing).",
-    )
     args = ap.parse_args()
 
     # Determine device
@@ -1031,6 +1222,10 @@ def main():
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device_str = args.device
+
+    print("\n" + "=" * 68)
+    print("  RSNA 2019 Intracranial Hemorrhage Detection & Grad-CAM Pipeline")
+    print("=" * 68)
     print(f"Device: {device_str}")
 
     # Initialize Predictor (loads model once)
@@ -1049,7 +1244,7 @@ def main():
             input_data = create_synthetic_ct(size=512)
             label = "Demo Synthetic Brain CT"
         else:
-            raw_paths = [x.strip().strip("\"'") for x in args.image.split(",")]
+            raw_paths = [clean_user_input_path(x) for x in args.image.split(",")]
             input_paths = [resolve_path(p) for p in raw_paths]
             missing = [p for p in input_paths if not os.path.exists(p)]
             if missing:
@@ -1061,37 +1256,36 @@ def main():
         return
 
     # Interactive Terminal Loop
-    print("\n" + "=" * 65)
-    print("  RSNA Intracranial Hemorrhage Detection - Terminal Input Mode")
-    print("=" * 65)
-    print("Instructions:")
-    print("  - Paste or type the image file address (DICOM / PNG / JPG)")
-    print("  - Press Enter with empty input to run demo CT")
+    print("\nInstructions:")
+    print("  - Paste or type the image file address/name (DICOM / PNG / JPG)")
+    print("  - Press Enter with empty input to run demo synthetic CT")
     print("  - Type 'q' or 'exit' to quit\n")
 
     while True:
         try:
-            user_input = input("Enter CT image address: ").strip().strip("\"'").strip()
+            user_input = input("Enter CT image address: ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nExiting.")
             break
 
-        if user_input.lower() in ["q", "quit", "exit"]:
-            print("Exiting viewer.")
+        cleaned = clean_user_input_path(user_input)
+
+        if cleaned.lower() in ["q", "quit", "exit"]:
+            print("Exiting.")
             break
 
-        if not user_input:
-            print("[Demo] Generating demo synthetic brain CT...")
+        if not cleaned:
+            print("\n[Demo] Generating synthetic brain CT scan...")
             img_data = create_synthetic_ct(size=512)
             _execute_and_display(predictor, img_data, "Demo Synthetic Brain CT", args)
             continue
 
-        raw_paths = [p.strip().strip("\"'") for p in user_input.split(",")]
+        raw_paths = [clean_user_input_path(p) for p in cleaned.split(",")]
         paths = [resolve_path(p) for p in raw_paths]
         missing = [p for p in paths if not os.path.exists(p)]
         if missing:
-            print(f"[Error] File not found: '{raw_paths[paths.index(missing[0])]}'")
-            print("Please check the path and try again.\n")
+            print(f"\n[Error] File not found: '{missing[0]}'")
+            print("Tips: Check spelling, paste the full path, or place the file in Downloads / current folder.\n")
             continue
 
         label = os.path.basename(paths[len(paths) // 2])
