@@ -1,0 +1,52 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Grad-CAM and inference output artifacts
+ich_gradcam*.png
+ich_gradcam*.json
+*.log
+
+# Environments
+.env/
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDEs and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Large training datasets (DICOM / archives)
+*.dcm.zip
+data.zip
+csv.zip
+stage_1_train_images/
+stage_1_test_images/
+stage_2_test_images/
+train_png/
+test_png/
